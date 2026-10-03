@@ -8108,6 +8108,47 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: `Run ${command.runId} is not interruptible.`,
         });
       }
+      // Background work can outlive a provider switch, such as a Codex dev
+      // server left running when the thread moved to Claude. Stop also reaches
+      // each other live provider thread that owns pending work; that
+      // interrupt's settle follow-up ends what its provider leaves behind.
+      // Work on a dead session is settled with this run's below.
+      const otherProviderInterrupts: Array<PendingOrchestrationEffectV2> = [];
+      if (hasBackgroundWork) {
+        const checkedProviderThreadIds = new Set<string>([providerThread.id]);
+        for (const item of pendingBackgroundTurnItems({
+          turnItems: projection.turnItems,
+          runs: projection.runs,
+        })) {
+          const owner = projection.providerThreads.find(
+            (candidate) => candidate.id === item.providerThreadId,
+          );
+          if (
+            owner === undefined ||
+            checkedProviderThreadIds.has(owner.id) ||
+            owner.providerSessionId === null ||
+            item.providerTurnId === null
+          ) {
+            continue;
+          }
+          checkedProviderThreadIds.add(owner.id);
+          const ownerSession = yield* providerSessions
+            .get(owner.providerSessionId)
+            .pipe(Effect.orElseSucceed(() => Option.none()));
+          if (Option.isNone(ownerSession)) continue;
+          otherProviderInterrupts.push({
+            id: `effect:${command.commandId}:provider-turn.interrupt:${item.providerTurnId}`,
+            commandId: command.commandId,
+            threadId: command.threadId,
+            request: {
+              type: "provider-turn.interrupt",
+              providerSessionId: owner.providerSessionId,
+              providerThreadId: owner.id,
+              providerTurnId: item.providerTurnId,
+            },
+          });
+        }
+      }
       // Stop on a settled thread's background work. Its process may be gone
       // (released, restarted) and only the projection still shows the work;
       // the settle follow-up ends whatever no provider reports ending.
@@ -8139,6 +8180,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           throughRunOrdinal: run.ordinal,
           now,
         });
+        yield* Ref.update(effects, (existing) => [...existing, ...otherProviderInterrupts]);
         return undefined;
       }
       if (providerThread.providerSessionId === null) {
@@ -8200,6 +8242,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             providerTurnId: providerTurn.id,
           },
         } satisfies PendingOrchestrationEffectV2,
+        ...otherProviderInterrupts,
       ]);
       return undefined;
     });
