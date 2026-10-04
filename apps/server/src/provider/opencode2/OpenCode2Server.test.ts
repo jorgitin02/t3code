@@ -1,6 +1,8 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -160,6 +162,227 @@ describe("OpenCode2Server error details", () => {
 });
 
 describe("OpenCode2Server managed service", () => {
+  it.effect("shares a cold managed-service acquisition between concurrent callers", () =>
+    Effect.gen(function* () {
+      const startEntered = yield* Deferred.make<void>();
+      const releaseStart = yield* Deferred.make<void>();
+      const firstUseEntered = yield* Deferred.make<void>();
+      const releaseFirstUse = yield* Deferred.make<void>();
+      const secondUseEntered = yield* Deferred.make<void>();
+      const reconnectStartEntered = yield* Deferred.make<void>();
+      const releaseReconnectStart = yield* Deferred.make<void>();
+      const staleVerifications = yield* Deferred.make<void>();
+      const commands: Array<ReadonlyArray<string>> = [];
+      let starts = 0;
+      let rejectVerifications = false;
+      let failedVerifications = 0;
+      const runtime = {
+        runOpenCodeCommand: (input: { readonly args: ReadonlyArray<string> }) =>
+          Effect.gen(function* () {
+            commands.push(input.args);
+            if (input.args[1] === "start") {
+              starts += 1;
+              if (starts === 1) {
+                yield* Deferred.succeed(startEntered, undefined);
+                yield* Deferred.await(releaseStart);
+              } else if (starts === 2) {
+                yield* Deferred.succeed(reconnectStartEntered, undefined);
+                yield* Deferred.await(releaseReconnectStart);
+              }
+            }
+            return {
+              stdout:
+                input.args[2] === "disabled"
+                  ? "false\n"
+                  : input.args[1] === "start"
+                    ? "http://127.0.0.1:4096\n"
+                    : "managed-password\n",
+              stderr: "",
+              code: 0,
+            };
+          }),
+      } as unknown as OpenCodeRuntime.OpenCodeRuntimeShape;
+      const http = Layer.succeed(
+        HttpClient.HttpClient,
+        HttpClient.make((request) =>
+          Effect.gen(function* () {
+            let status = 200;
+            if (rejectVerifications && failedVerifications < 2) {
+              failedVerifications += 1;
+              status = 500;
+              if (failedVerifications === 2) yield* Deferred.succeed(staleVerifications, undefined);
+              yield* Deferred.await(staleVerifications);
+            }
+            return HttpClientResponse.fromWeb(
+              request,
+              new Response(INFO_BODY, {
+                status,
+                headers: { "content-type": "application/json" },
+              }),
+            );
+          }),
+        ),
+      );
+      const server = yield* OpenCode2Server.make({
+        binaryPath: "/configured/opencode",
+        serverUrl: "",
+        serverPassword: "",
+        directory: "/project",
+        environment: {},
+      }).pipe(
+        Effect.provideService(OpenCodeRuntime.OpenCodeRuntime, runtime),
+        Effect.provide(
+          Layer.mergeAll(OpenCode2Client.layer.pipe(Layer.provide(http)), NodeServices.layer),
+        ),
+      );
+      const bothReady = yield* Deferred.make<void>();
+      let readyCount = 0;
+      let useCount = 0;
+      const borrow = Effect.sync(() => {
+        readyCount += 1;
+        if (readyCount === 2) return Deferred.succeed(bothReady, undefined);
+        return Effect.void;
+      }).pipe(
+        Effect.flatten,
+        Effect.andThen(
+          server.withConnection((connection) =>
+            Effect.suspend(() => {
+              useCount += 1;
+              return useCount === 1
+                ? Deferred.succeed(firstUseEntered, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseFirstUse)),
+                    Effect.as(connection),
+                  )
+                : Deferred.succeed(secondUseEntered, undefined).pipe(Effect.as(connection));
+            }),
+          ),
+        ),
+      );
+      const first = yield* borrow.pipe(Effect.forkChild({ startImmediately: true }));
+      const second = yield* borrow.pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(bothReady);
+      yield* Deferred.await(startEntered);
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(releaseStart, undefined);
+      yield* Deferred.await(firstUseEntered);
+      yield* Deferred.await(secondUseEntered);
+      yield* Deferred.succeed(releaseFirstUse, undefined);
+      const coldConnections = yield* Effect.all([Fiber.join(first), Fiber.join(second)]);
+      assert.strictEqual(coldConnections[0], coldConnections[1]);
+      assert.deepStrictEqual(commands, [
+        ["service", "get", "disabled"],
+        ["service", "start"],
+        ["service", "get", "password"],
+      ]);
+
+      rejectVerifications = true;
+      readyCount = 0;
+      const bothReconnectReady = yield* Deferred.make<void>();
+      const reconnect = Effect.sync(() => {
+        readyCount += 1;
+        if (readyCount === 2) return Deferred.succeed(bothReconnectReady, undefined);
+        return Effect.void;
+      }).pipe(
+        Effect.flatten,
+        Effect.andThen(server.withConnection((connection) => Effect.succeed(connection))),
+      );
+      const reconnectOne = yield* reconnect.pipe(Effect.forkChild({ startImmediately: true }));
+      const reconnectTwo = yield* reconnect.pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(bothReconnectReady);
+      yield* Deferred.await(staleVerifications);
+      yield* Deferred.await(reconnectStartEntered);
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(releaseReconnectStart, undefined);
+      yield* Effect.all([Fiber.join(reconnectOne), Fiber.join(reconnectTwo)]);
+      assert.deepStrictEqual(commands, [
+        ["service", "get", "disabled"],
+        ["service", "start"],
+        ["service", "get", "password"],
+        ["service", "get", "disabled"],
+        ["service", "start"],
+        ["service", "get", "password"],
+      ]);
+    }),
+  );
+
+  it.effect("releases the acquisition permit after a failed start so a waiter can retry", () =>
+    Effect.gen(function* () {
+      const startEntered = yield* Deferred.make<void>();
+      const releaseStart = yield* Deferred.make<void>();
+      const commands: Array<ReadonlyArray<string>> = [];
+      let starts = 0;
+      const runtime = {
+        runOpenCodeCommand: (input: { readonly args: ReadonlyArray<string> }) =>
+          Effect.gen(function* () {
+            commands.push(input.args);
+            if (input.args[1] === "start") {
+              starts += 1;
+              if (starts === 1) {
+                yield* Deferred.succeed(startEntered, undefined);
+                yield* Deferred.await(releaseStart);
+                return { stdout: "", stderr: "failed", code: 1 };
+              }
+            }
+            return {
+              stdout:
+                input.args[2] === "disabled"
+                  ? "false\n"
+                  : input.args[1] === "start"
+                    ? "http://127.0.0.1:4096\n"
+                    : "managed-password\n",
+              stderr: "",
+              code: 0,
+            };
+          }),
+      } as unknown as OpenCodeRuntime.OpenCodeRuntimeShape;
+      const http = serverReplying({
+        status: 200,
+        contentType: "application/json",
+        body: INFO_BODY,
+      });
+      const server = yield* OpenCode2Server.make({
+        binaryPath: "/configured/opencode",
+        serverUrl: "",
+        serverPassword: "",
+        directory: "/project",
+        environment: {},
+      }).pipe(
+        Effect.provideService(OpenCodeRuntime.OpenCodeRuntime, runtime),
+        Effect.provide(
+          Layer.mergeAll(OpenCode2Client.layer.pipe(Layer.provide(http)), NodeServices.layer),
+        ),
+      );
+      const bothReady = yield* Deferred.make<void>();
+      let readyCount = 0;
+      const borrow = Effect.sync(() => {
+        readyCount += 1;
+        if (readyCount === 2) return Deferred.succeed(bothReady, undefined);
+        return Effect.void;
+      }).pipe(
+        Effect.flatten,
+        Effect.andThen(
+          Effect.exit(server.withConnection((connection) => Effect.succeed(connection))),
+        ),
+      );
+      const first = yield* borrow.pipe(Effect.forkChild({ startImmediately: true }));
+      const second = yield* borrow.pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(bothReady);
+      yield* Deferred.await(startEntered);
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(releaseStart, undefined);
+      const outcomes = yield* Effect.all([Fiber.join(first), Fiber.join(second)]);
+      assert.isTrue(outcomes.some(Exit.isFailure));
+      assert.isTrue(outcomes.some(Exit.isSuccess));
+      assert.deepStrictEqual(commands, [
+        ["service", "get", "disabled"],
+        ["service", "start"],
+        ["service", "get", "disabled"],
+        ["service", "start"],
+        ["service", "get", "password"],
+      ]);
+    }),
+  );
+
   it.effect("uses OpenCode's channel-aware managed service and persisted password", () => {
     const managedPassword = "managed password ";
     const commands: Array<{

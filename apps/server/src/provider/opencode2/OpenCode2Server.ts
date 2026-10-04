@@ -11,6 +11,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as P from "effect/Predicate";
 import * as Redacted from "effect/Redacted";
+import * as Semaphore from "effect/Semaphore";
 import * as HttpClientError from "effect/unstable/http/HttpClientError";
 
 import * as OpenCodeRuntime from "../opencodeRuntime.ts";
@@ -231,17 +232,28 @@ export const make = Effect.fn("OpenCode2Server.make")(function* (input: {
     yield* remember(connection);
     return connection;
   });
+  const acquisitionLock = yield* Semaphore.make(1);
+  const acquireManagedConnection = (observed: OpenCode2Connection | undefined) =>
+    acquisitionLock.withPermits(1)(
+      Effect.suspend(() => {
+        const cached = latest;
+        return cached !== observed && cached !== undefined
+          ? Effect.succeed(cached)
+          : ensureManagedConnection;
+      }),
+    );
 
   return OpenCode2Server.of({
     withConnection: (use) =>
-      Effect.suspend(() =>
-        latest === undefined
-          ? ensureManagedConnection
-          : verifyServer(latest.client).pipe(
-              Effect.as(latest),
-              Effect.catch(() => ensureManagedConnection),
-            ),
-      ).pipe(Effect.flatMap(use)),
+      Effect.suspend(() => {
+        const cached = latest;
+        return cached === undefined
+          ? acquireManagedConnection(undefined)
+          : verifyServer(cached.client).pipe(
+              Effect.as(cached),
+              Effect.catch(() => acquireManagedConnection(cached)),
+            );
+      }).pipe(Effect.flatMap(use)),
   });
 });
 
